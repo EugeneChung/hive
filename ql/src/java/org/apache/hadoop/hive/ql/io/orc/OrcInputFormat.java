@@ -29,6 +29,7 @@ import java.nio.ByteBuffer;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -99,6 +100,7 @@ import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.VirtualColumn;
 import org.apache.hadoop.hive.ql.txn.compactor.metrics.DeltaFilesMetricReporter;
 import org.apache.hadoop.hive.ql.txn.compactor.metrics.DeltaFilesMetricReporter.DeltaFilesMetricType;
+import org.apache.hadoop.hive.ql.plan.MapWork;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hadoop.hive.serde2.ColumnProjectionUtils;
 import org.apache.hadoop.hive.serde2.SerDeStats;
@@ -657,6 +659,7 @@ public class OrcInputFormat implements InputFormat<NullWritable, OrcStruct>,
     private final int numBuckets;
     private final int splitStrategyBatchMs;
     private final long maxSize;
+    private final BitSet includedBuckets;
     private final long minSize;
     private final int etlFileThreshold;
     private final boolean footerInSplits;
@@ -665,28 +668,29 @@ public class OrcInputFormat implements InputFormat<NullWritable, OrcStruct>,
     private final AtomicInteger cacheHitCounter = new AtomicInteger(0);
     private final AtomicInteger numFilesCounter = new AtomicInteger(0);
     private final ValidWriteIdList writeIdList;
-    private SplitStrategyKind splitStrategyKind;
+    private final SplitStrategyKind splitStrategyKind;
     private final SearchArgument sarg;
     private final AcidOperationalProperties acidOperationalProperties;
     private final boolean isAcid;
     private final boolean isVectorMode;
 
     Context(Configuration conf) throws IOException {
-      this(conf, 1, null);
+      this(conf, 1, null, null);
     }
 
     Context(Configuration conf, final int minSplits) throws IOException {
-      this(conf, minSplits, null);
+      this(conf, minSplits, null, null);
     }
 
     @VisibleForTesting
-    Context(Configuration conf, final int minSplits, ExternalFooterCachesByConf efc)
+    Context(Configuration conf, final int minSplits, ExternalFooterCachesByConf efc, BitSet includedBuckets)
         throws IOException {
       this.conf = conf;
       this.isAcid = AcidUtils.isFullAcidScan(conf);
       this.isVectorMode = Utilities.getIsVectorized(conf);
       this.forceThreadpool = HiveConf.getBoolVar(conf, ConfVars.HIVE_IN_TEST);
       this.sarg = ConvertAstToSearchArg.createFromConf(conf);
+      this.includedBuckets = includedBuckets;
       minSize = HiveConf.getLongVar(conf, ConfVars.MAPREDMINSPLITSIZE, DEFAULT_MIN_SPLIT_SIZE);
       maxSize = HiveConf.getLongVar(conf, ConfVars.MAPREDMAXSPLITSIZE, DEFAULT_MAX_SPLIT_SIZE);
       String ss = conf.get(ConfVars.HIVE_ORC_SPLIT_STRATEGY.varname);
@@ -1823,7 +1827,7 @@ public class OrcInputFormat implements InputFormat<NullWritable, OrcStruct>,
         // independent split strategies for them. There is a global flag 'isOriginal' that is set
         // on a per split strategy basis and it has to be same for all the files in that strategy.
         List<SplitStrategy<?>> splitStrategies = determineSplitStrategies(combinedCtx, context, directory.getFs(),
-            directory.getPath(), directory.getFiles(), directory.getDeleteDeltas(), readerTypes, ugi,
+            directory.getPath(), pruneBuckets(context, directory.getFiles()), directory.getDeleteDeltas(), readerTypes, ugi,
             allowSyntheticFileIds);
 
         for (SplitStrategy<?> splitStrategy : splitStrategies) {
@@ -1876,6 +1880,25 @@ public class OrcInputFormat implements InputFormat<NullWritable, OrcStruct>,
       }
     }
     return splits;
+  }
+
+  private static List<FileInfo> pruneBuckets(Context context, List<FileInfo> fileInfos) {
+    if (context.includedBuckets == null) return fileInfos;
+
+    BitSet buckets = context.includedBuckets;
+    String bucketsAsStr = buckets.toString();
+    List<FileInfo> filteredFileInfos = new ArrayList<>();
+    for (FileInfo fileInfo : fileInfos) {
+      Path path = fileInfo.getHdfsFileStatusWithId().getFileStatus().getPath();
+      int bucket = Utilities.getBucketIdFromFile(path.getName());
+      if (bucket < 0 || buckets.get(bucket)) {
+        // match or UNKNOWN
+        filteredFileInfos.add(fileInfo);
+      } else {
+        LOG.info("Pruning with IN ({}) - removing {}", bucketsAsStr, path);
+      }
+    }
+    return filteredFileInfos;
   }
 
   @VisibleForTesting
@@ -1944,12 +1967,13 @@ public class OrcInputFormat implements InputFormat<NullWritable, OrcStruct>,
     long start = System.currentTimeMillis();
     LOG.info("getSplits started");
     Configuration conf = job;
+    MapWork work = Utilities.getMapWork(job);
     if (HiveConf.getBoolVar(job, HiveConf.ConfVars.HIVE_ORC_MS_FOOTER_CACHE_ENABLED)) {
       // Create HiveConf once, since this is expensive.
       conf = new HiveConf(conf, OrcInputFormat.class);
     }
     List<OrcSplit> result = generateSplitsInfo(conf,
-        new Context(conf, numSplits, createExternalCaches()));
+        new Context(conf, numSplits, createExternalCaches(), work != null ? work.getIncludedBuckets() : null)));
     DeltaFilesMetricReporter.backPropagateAcidMetrics(job, conf);
 
     long end = System.currentTimeMillis();

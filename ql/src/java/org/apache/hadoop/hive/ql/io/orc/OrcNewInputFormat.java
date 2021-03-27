@@ -138,6 +138,6 @@ public class OrcNewInputFormat extends InputFormat<NullWritable, OrcStruct>{
       // Create HiveConf once, since this is expensive.
       conf = new HiveConf(conf, OrcInputFormat.class);
     }
-    return new Context(conf, numSplits, null);
+    return new Context(conf, numSplits);
   }
 }
